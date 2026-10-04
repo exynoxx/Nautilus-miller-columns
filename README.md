@@ -5,6 +5,10 @@ A Miller-columns ("column view") mode for GNOME Files (Nautilus), as a patch.
 Selecting a folder opens its contents in a new column to the right. The folders
 on the open path stay highlighted.
 
+![Columns view: Documents › Projects › nautilus › src](assets/screenshot.png)
+
+![Navigating the columns with the keyboard](assets/demo.gif)
+
 ## Apply
 
 Against upstream Nautilus, commit `141cc0555` ("previewer: Add rename and trash DBus subscriptions"):
