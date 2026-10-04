@@ -50,10 +50,10 @@ index c15e6ce22..a51d37327 100644
    'nautilus-date-entry-row.c',
 diff --git a/src/nautilus-column-model.c b/src/nautilus-column-model.c
 new file mode 100644
-index 000000000..8906c897d
+index 000000000..028f251da
 --- /dev/null
 +++ b/src/nautilus-column-model.c
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,415 @@
 +/*
 + * Copyright (C) 2026 The GNOME project contributors
 + *
@@ -256,21 +256,20 @@ index 000000000..8906c897d
 +                                              global_position);
 +}
 +
++/* Maps a column-local selection onto the shared model. A replace also clears
++ * the selection in every other column. */
 +static gboolean
-+nautilus_column_model_set_selection (GtkSelectionModel *model,
-+                                     GtkBitset         *selected,
-+                                     GtkBitset         *mask)
++apply_selection (NautilusColumnModel *self,
++                 GtkBitset           *selected,
++                 GtkBitset           *mask,
++                 gboolean             replace)
 +{
-+    NautilusColumnModel *self = NAUTILUS_COLUMN_MODEL (model);
 +    g_autoptr (GtkBitset) global_selected = gtk_bitset_new_empty ();
 +    g_autoptr (GtkBitset) global_mask = gtk_bitset_new_empty ();
 +    GtkBitsetIter iter;
 +    guint i;
 +
-+    /* A full-column mask means "replace the selection", which must also clear
-+     * the other columns. */
-+    if (self->rows->len > 0 &&
-+        gtk_bitset_get_size_in_range (mask, 0, self->rows->len - 1) == self->rows->len)
++    if (replace)
 +    {
 +        gtk_bitset_add_range (global_mask, 0,
 +                              g_list_model_get_n_items (G_LIST_MODEL (self->shared_model)));
@@ -298,12 +297,53 @@ index 000000000..8906c897d
 +                                              global_selected, global_mask);
 +}
 +
++static gboolean
++nautilus_column_model_select_range (GtkSelectionModel *model,
++                                    guint              position,
++                                    guint              n_items,
++                                    gboolean           unselect_rest)
++{
++    NautilusColumnModel *self = NAUTILUS_COLUMN_MODEL (model);
++    g_autoptr (GtkBitset) range = gtk_bitset_new_range (position, n_items);
++
++    return apply_selection (self, range, range, unselect_rest);
++}
++
++static gboolean
++nautilus_column_model_select_all (GtkSelectionModel *model)
++{
++    NautilusColumnModel *self = NAUTILUS_COLUMN_MODEL (model);
++
++    return nautilus_column_model_select_range (model, 0, self->rows->len, TRUE);
++}
++
++static gboolean
++nautilus_column_model_set_selection (GtkSelectionModel *model,
++                                     GtkBitset         *selected,
++                                     GtkBitset         *mask)
++{
++    NautilusColumnModel *self = NAUTILUS_COLUMN_MODEL (model);
++    gboolean replace;
++
++    /* Clicks and ranges arrive through select_item() and select_range(), which
++     * say whether to unselect the rest. A plain rubberband is the only caller
++     * of this that masks the whole column while selecting part of it. */
++    replace = (self->rows->len > 0 &&
++               gtk_bitset_get_size_in_range (mask, 0, self->rows->len - 1) == self->rows->len &&
++               !gtk_bitset_is_empty (selected) &&
++               !gtk_bitset_equals (selected, mask));
++
++    return apply_selection (self, selected, mask, replace);
++}
++
 +static void
 +nautilus_column_model_selection_model_init (GtkSelectionModelInterface *iface)
 +{
 +    iface->is_selected = nautilus_column_model_is_selected;
 +    iface->get_selection_in_range = nautilus_column_model_get_selection_in_range;
 +    iface->select_item = nautilus_column_model_select_item;
++    iface->select_range = nautilus_column_model_select_range;
++    iface->select_all = nautilus_column_model_select_all;
 +    iface->set_selection = nautilus_column_model_set_selection;
 +    iface->unselect_item = nautilus_column_model_unselect_item;
 +}
@@ -474,10 +514,10 @@ index 000000000..df6013a81
 +G_END_DECLS
 diff --git a/src/nautilus-columns-view.c b/src/nautilus-columns-view.c
 new file mode 100644
-index 000000000..04e4c3aff
+index 000000000..9f5517132
 --- /dev/null
 +++ b/src/nautilus-columns-view.c
-@@ -0,0 +1,975 @@
+@@ -0,0 +1,1020 @@
 +/*
 + * Copyright (C) 2026 The GNOME project contributors
 + *
@@ -514,6 +554,7 @@ index 000000000..04e4c3aff
 +    GtkWidget *scrolled_window;
 +    GtkWidget *list_view;
 +    NautilusColumnModel *model;
++    NautilusViewItem *directory_item; /* NULL for the view's own directory */
 +} Column;
 +
 +struct _NautilusColumnsView
@@ -521,7 +562,11 @@ index 000000000..04e4c3aff
 +    NautilusListBase parent_instance;
 +
 +    GtkWidget *columns_box;
++    GtkWidget *viewport;
 +    GPtrArray *columns;
++
++    /* Column under the last press, for background operations. */
++    guint pressed_column;
 +
 +    gint zoom_level;
 +
@@ -531,7 +576,7 @@ index 000000000..04e4c3aff
 +
 +    /* Collapsing rows makes the shared model emit right back. */
 +    gboolean updating_columns;
-+    gboolean scroll_to_end;
++    guint scroll_tick_id;
 +    guint prune_columns_id;
 +
 +    NautilusViewModel *connected_model; /* Unowned */
@@ -575,37 +620,11 @@ index 000000000..04e4c3aff
 +}
 +
 +static guint
-+get_icon_size_for_zoom_level (NautilusListZoomLevel zoom_level)
-+{
-+    switch (zoom_level)
-+    {
-+        case NAUTILUS_LIST_ZOOM_LEVEL_SMALL:
-+        {
-+            return NAUTILUS_LIST_ICON_SIZE_SMALL;
-+        }
-+        break;
-+
-+        case NAUTILUS_LIST_ZOOM_LEVEL_MEDIUM:
-+        {
-+            return NAUTILUS_LIST_ICON_SIZE_MEDIUM;
-+        }
-+        break;
-+
-+        case NAUTILUS_LIST_ZOOM_LEVEL_LARGE:
-+        {
-+            return NAUTILUS_LIST_ICON_SIZE_LARGE;
-+        }
-+        break;
-+    }
-+    g_return_val_if_reached (NAUTILUS_LIST_ICON_SIZE_MEDIUM);
-+}
-+
-+static guint
 +real_get_icon_size (NautilusListBase *list_base)
 +{
 +    NautilusColumnsView *self = NAUTILUS_COLUMNS_VIEW (list_base);
 +
-+    return get_icon_size_for_zoom_level (self->zoom_level);
++    return list_zoom_level_get_icon_size (self->zoom_level);
 +}
 +
 +static int
@@ -614,18 +633,6 @@ index 000000000..04e4c3aff
 +    NautilusColumnsView *self = NAUTILUS_COLUMNS_VIEW (list_base);
 +
 +    return self->zoom_level;
-+}
-+
-+/* ponytail: zoom level shared with the list view; own schema if it annoys. */
-+static gint
-+get_default_zoom_level (void)
-+{
-+    gint default_zoom_level = g_settings_get_enum (nautilus_list_view_preferences,
-+                                                   NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL);
-+
-+    return CLAMP (default_zoom_level,
-+                  columns_view_info.zoom_level_min,
-+                  columns_view_info.zoom_level_max);
 +}
 +
 +static void
@@ -638,25 +645,7 @@ index 000000000..04e4c3aff
 +                      new_level <= columns_view_info.zoom_level_max);
 +
 +    self->zoom_level = new_level;
-+
-+    if (g_settings_get_enum (nautilus_list_view_preferences,
-+                             NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL) != new_level)
-+    {
-+        g_settings_set_enum (nautilus_list_view_preferences,
-+                             NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL,
-+                             new_level);
-+    }
-+
-+    g_object_notify (G_OBJECT (self), "icon-size");
-+
-+    if (self->zoom_level == NAUTILUS_LIST_ZOOM_LEVEL_SMALL)
-+    {
-+        gtk_widget_add_css_class (GTK_WIDGET (self), "compact");
-+    }
-+    else
-+    {
-+        gtk_widget_remove_css_class (GTK_WIDGET (self), "compact");
-+    }
++    nautilus_list_base_apply_list_zoom_level (list_base, new_level);
 +}
 +
 +static gint
@@ -768,31 +757,48 @@ index 000000000..04e4c3aff
 +                             column_position, flags, scroll);
 +}
 +
++static guint find_focused_column (NautilusColumnsView *self);
++
++/* Background operations target the column last pressed, else the focused one,
++ * else the rightmost one. */
 +static NautilusViewItem *
 +real_get_backing_item (NautilusListBase *list_base)
 +{
 +    NautilusColumnsView *self = NAUTILUS_COLUMNS_VIEW (list_base);
-+    GtkTreeListRow *parent_row;
++    guint index = self->pressed_column;
++    NautilusViewItem *item;
 +
 +    if (self->columns->len == 0)
 +    {
 +        return NULL;
 +    }
 +
-+    /* Background operations target the rightmost column's directory. */
-+    parent_row = nautilus_column_model_get_parent_row (get_column (self, self->columns->len - 1)->model);
++    /* Otherwise the rightmost folder, which is what the path bar shows. */
++    if (index >= self->columns->len)
++    {
++        index = self->columns->len - 1;
++    }
 +
-+    return (parent_row != NULL) ? gtk_tree_list_row_get_item (parent_row) : NULL;
++    item = get_column (self, index)->directory_item;
++
++    return (item != NULL) ? g_object_ref (item) : NULL;
 +}
 +
 +/* The rightmost column's folder, or NULL when that is the view's own. */
 +static void
 +emit_display_location_changed (NautilusColumnsView *self)
 +{
-+    g_autoptr (NautilusViewItem) item = real_get_backing_item (NAUTILUS_LIST_BASE (self));
-+    g_autoptr (GFile) location = (item != NULL) ?
-+                                 nautilus_file_get_location (nautilus_view_item_get_file (item)) :
-+                                 NULL;
++    NautilusViewItem *item = NULL;
++    g_autoptr (GFile) location = NULL;
++
++    if (self->columns->len > 0)
++    {
++        item = get_column (self, self->columns->len - 1)->directory_item;
++    }
++    if (item != NULL)
++    {
++        location = nautilus_file_get_location (nautilus_view_item_get_file (item));
++    }
 +
 +    g_signal_emit (self, signals[DISPLAY_LOCATION_CHANGED], 0, location);
 +}
@@ -806,6 +812,7 @@ index 000000000..04e4c3aff
 +    gtk_box_remove (GTK_BOX (column->view->columns_box), column->scrolled_window);
 +
 +    g_clear_object (&column->model);
++    g_clear_object (&column->directory_item);
 +    g_free (column);
 +}
 +
@@ -865,16 +872,27 @@ index 000000000..04e4c3aff
 +        Column *column = get_column (self, self->columns->len - 1);
 +        GtkTreeListRow *parent_row = nautilus_column_model_get_parent_row (column->model);
 +
-+        if (parent_row != NULL)
++        if (column->directory_item != NULL)
 +        {
-+            g_autoptr (NautilusViewItem) item = gtk_tree_list_row_get_item (parent_row);
++            g_autoptr (NautilusViewItem) row_item = (parent_row != NULL) ?
++                                                    gtk_tree_list_row_get_item (parent_row) :
++                                                    NULL;
 +
 +            /* Collapse first, so the tree model releases the child store. */
-+            gtk_tree_list_row_set_expanded (parent_row, FALSE);
-+
-+            if (item != NULL)
++            if (parent_row != NULL)
 +            {
-+                g_signal_emit (self, signals[UNLOAD_SUBDIRECTORY], 0, item);
++                gtk_tree_list_row_set_expanded (parent_row, FALSE);
++            }
++
++            if (row_item == NULL ||
++                nautilus_file_is_gone (nautilus_view_item_get_file (column->directory_item)))
++            {
++                /* The directory is gone; nothing to keep it loaded for. */
++                g_signal_emit (self, signals[UNLOAD_SUBDIRECTORY], 0, column->directory_item);
++            }
++            else
++            {
++                nautilus_list_base_unload_subdirectory_delayed (NAUTILUS_LIST_BASE (self), parent_row);
 +            }
 +        }
 +
@@ -886,7 +904,11 @@ index 000000000..04e4c3aff
 +        set_path_row (get_column (self, self->columns->len - 1), NULL);
 +    }
 +
-+    self->scroll_to_end = FALSE;
++    if (self->scroll_tick_id != 0)
++    {
++        gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->scroll_tick_id);
++        self->scroll_tick_id = 0;
++    }
 +    emit_display_location_changed (self);
 +
 +    self->updating_columns = was_updating;
@@ -969,6 +991,33 @@ index 000000000..04e4c3aff
 +    nautilus_list_base_activate_selection (NAUTILUS_LIST_BASE (self), FALSE);
 +}
 +
++/* Runs once the new column is allocated, so its bounds are known. */
++static gboolean
++scroll_to_last_column_cb (GtkWidget     *widget,
++                          GdkFrameClock *frame_clock,
++                          gpointer       user_data)
++{
++    NautilusColumnsView *self = NAUTILUS_COLUMNS_VIEW (widget);
++    GtkWidget *last;
++
++    if (self->columns->len == 0)
++    {
++        self->scroll_tick_id = 0;
++        return G_SOURCE_REMOVE;
++    }
++
++    last = get_column (self, self->columns->len - 1)->scrolled_window;
++    if (gtk_widget_get_width (last) == 0)
++    {
++        return G_SOURCE_CONTINUE;
++    }
++
++    self->scroll_tick_id = 0;
++    gtk_viewport_scroll_to (GTK_VIEWPORT (self->viewport), last, NULL);
++
++    return G_SOURCE_REMOVE;
++}
++
 +static void
 +append_column (NautilusColumnsView *self,
 +               GtkTreeListRow      *parent_row)
@@ -981,6 +1030,7 @@ index 000000000..04e4c3aff
 +    column = g_new0 (Column, 1);
 +    column->view = self;
 +    column->model = nautilus_column_model_new (model, parent_row);
++    column->directory_item = (parent_row != NULL) ? gtk_tree_list_row_get_item (parent_row) : NULL;
 +
 +    GtkListItemFactory *factory = gtk_signal_list_item_factory_new ();
 +    g_signal_connect (factory, "setup", G_CALLBACK (setup_cell), column);
@@ -1007,7 +1057,12 @@ index 000000000..04e4c3aff
 +    gtk_box_append (GTK_BOX (self->columns_box), column->scrolled_window);
 +    g_ptr_array_add (self->columns, column);
 +
-+    self->scroll_to_end = TRUE;
++    if (self->scroll_tick_id == 0)
++    {
++        self->scroll_tick_id = gtk_widget_add_tick_callback (GTK_WIDGET (self),
++                                                             scroll_to_last_column_cb,
++                                                             NULL, NULL);
++    }
 +    emit_display_location_changed (self);
 +}
 +
@@ -1108,6 +1163,22 @@ index 000000000..04e4c3aff
 +}
 +
 +static void
++on_selection_changed (NautilusColumnsView *self)
++{
++    NautilusViewModel *model = nautilus_list_base_get_model (NAUTILUS_LIST_BASE (self));
++    g_autoptr (GtkBitset) selection = gtk_selection_model_get_selection (GTK_SELECTION_MODEL (model));
++
++    /* A selection moves the focus, which then decides the backing column.
++     * Background presses only unselect, so they keep the pressed column. */
++    if (!gtk_bitset_is_empty (selection))
++    {
++        self->pressed_column = G_MAXUINT;
++    }
++
++    schedule_prune_columns (self);
++}
++
++static void
 +on_model_changed (NautilusColumnsView *self)
 +{
 +    NautilusViewModel *model = nautilus_list_base_get_model (NAUTILUS_LIST_BASE (self));
@@ -1129,7 +1200,7 @@ index 000000000..04e4c3aff
 +    nautilus_view_model_expand_as_a_tree (model, self->expand_as_a_tree);
 +
 +    g_signal_connect_object (model, "selection-changed",
-+                             G_CALLBACK (schedule_prune_columns), self,
++                             G_CALLBACK (on_selection_changed), self,
 +                             G_CONNECT_SWAPPED);
 +    g_signal_connect_object (model, "items-changed",
 +                             G_CALLBACK (schedule_prune_columns), self,
@@ -1146,21 +1217,9 @@ index 000000000..04e4c3aff
 +static void
 +update_sort_directories_first (NautilusColumnsView *self)
 +{
-+    NautilusFile *directory_as_file = nautilus_list_base_get_directory_as_file (NAUTILUS_LIST_BASE (self));
 +    NautilusViewModel *model = nautilus_list_base_get_model (NAUTILUS_LIST_BASE (self));
 +
-+    /* Always treat directories as normal items in search and recent. Recent
-+     * can accidentally contain directories when they were picked via file chooser. */
-+    if (nautilus_file_is_in_search (directory_as_file) ||
-+        nautilus_file_is_in_recent (directory_as_file))
-+    {
-+        self->directories_first = FALSE;
-+    }
-+    else
-+    {
-+        self->directories_first = g_settings_get_boolean (gtk_filechooser_preferences,
-+                                                          NAUTILUS_PREFERENCES_SORT_DIRECTORIES_FIRST);
-+    }
++    self->directories_first = nautilus_list_base_get_sort_directories_first (NAUTILUS_LIST_BASE (self));
 +
 +    if (model != NULL)
 +    {
@@ -1286,7 +1345,10 @@ index 000000000..04e4c3aff
 +nautilus_columns_view_grab_focus (GtkWidget *widget)
 +{
 +    NautilusColumnsView *self = NAUTILUS_COLUMNS_VIEW (widget);
-+    guint index = find_focused_column (self);
++    /* A background press focuses the view; focus the pressed column. */
++    guint index = (self->pressed_column < self->columns->len) ?
++                  self->pressed_column :
++                  find_focused_column (self);
 +
 +    if (self->columns->len > 0)
 +    {
@@ -1302,18 +1364,26 @@ index 000000000..04e4c3aff
 +}
 +
 +static void
-+on_hadjustment_changed (GtkAdjustment       *adjustment,
++on_columns_box_pressed (GtkGestureClick     *gesture,
++                        gint                 n_press,
++                        gdouble              x,
++                        gdouble              y,
 +                        NautilusColumnsView *self)
 +{
-+    if (!self->scroll_to_end)
-+    {
-+        return;
-+    }
++    GtkWidget *picked = gtk_widget_pick (self->columns_box, x, y, GTK_PICK_DEFAULT);
 +
-+    self->scroll_to_end = FALSE;
-+    gtk_adjustment_set_value (adjustment,
-+                              gtk_adjustment_get_upper (adjustment) -
-+                              gtk_adjustment_get_page_size (adjustment));
++    /* Past the last column counts as the last column. */
++    self->pressed_column = (self->columns->len > 0) ? self->columns->len - 1 : G_MAXUINT;
++    for (guint i = 0; picked != NULL && i < self->columns->len; i++)
++    {
++        GtkWidget *scrolled_window = get_column (self, i)->scrolled_window;
++
++        if (picked == scrolled_window || gtk_widget_is_ancestor (picked, scrolled_window))
++        {
++            self->pressed_column = i;
++            break;
++        }
++    }
 +}
 +
 +static void
@@ -1333,6 +1403,11 @@ index 000000000..04e4c3aff
 +    g_clear_object (&self->view_model_sorter);
 +
 +    g_clear_handle_id (&self->prune_columns_id, g_source_remove);
++    if (self->scroll_tick_id != 0)
++    {
++        gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->scroll_tick_id);
++        self->scroll_tick_id = 0;
++    }
 +
 +    g_ptr_array_set_size (self->columns, 0);
 +
@@ -1399,11 +1474,13 @@ index 000000000..04e4c3aff
 +nautilus_columns_view_init (NautilusColumnsView *self)
 +{
 +    GtkWidget *scrolled_window = nautilus_list_base_get_scrolled_window (NAUTILUS_LIST_BASE (self));
++    GtkEventController *controller;
 +
 +    gtk_widget_add_css_class (GTK_WIDGET (self), "nautilus-columns-view");
 +
 +    self->columns = g_ptr_array_new_with_free_func ((GDestroyNotify) column_free);
 +    self->expand_as_a_tree = TRUE;
++    self->pressed_column = G_MAXUINT;
 +
 +    self->columns_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 0);
 +    gtk_accessible_update_property (GTK_ACCESSIBLE (self->columns_box),
@@ -1416,11 +1493,17 @@ index 000000000..04e4c3aff
 +    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scrolled_window),
 +                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_NEVER);
 +    gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scrolled_window), self->columns_box);
-+    g_signal_connect_object (gtk_scrolled_window_get_hadjustment (GTK_SCROLLED_WINDOW (scrolled_window)),
-+                             "changed", G_CALLBACK (on_hadjustment_changed), self,
-+                             G_CONNECT_DEFAULT);
++    self->viewport = gtk_scrolled_window_get_child (GTK_SCROLLED_WINDOW (scrolled_window));
++
++    /* Capture phase, to see presses that items claim too. */
++    controller = GTK_EVENT_CONTROLLER (gtk_gesture_click_new ());
++    gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (controller), 0);
++    gtk_event_controller_set_propagation_phase (controller, GTK_PHASE_CAPTURE);
++    g_signal_connect (controller, "pressed", G_CALLBACK (on_columns_box_pressed), self);
++    gtk_widget_add_controller (self->columns_box, controller);
 +
 +    nautilus_list_base_setup_gestures (NAUTILUS_LIST_BASE (self));
++    nautilus_list_base_set_single_click_selects_folders (NAUTILUS_LIST_BASE (self));
 +
 +    g_signal_connect_swapped (self, "notify::model", G_CALLBACK (on_model_changed), self);
 +
@@ -1430,10 +1513,12 @@ index 000000000..04e4c3aff
 +                             self,
 +                             G_CONNECT_SWAPPED);
 +
-+    nautilus_list_base_set_zoom_level (NAUTILUS_LIST_BASE (self), get_default_zoom_level ());
++    /* ponytail: zoom level shared with the list view; own schema if it annoys. */
++    nautilus_list_base_set_zoom_level (NAUTILUS_LIST_BASE (self),
++                                       nautilus_list_base_get_default_list_zoom_level (NAUTILUS_LIST_BASE (self)));
 +
 +    /* Capture phase, otherwise GtkListBase's cursor movement handles them. */
-+    GtkEventController *controller = gtk_shortcut_controller_new ();
++    controller = gtk_shortcut_controller_new ();
 +    gtk_widget_add_controller (GTK_WIDGET (self), controller);
 +    gtk_event_controller_set_propagation_phase (controller, GTK_PHASE_CAPTURE);
 +    gtk_shortcut_controller_add_shortcut (GTK_SHORTCUT_CONTROLLER (controller),
@@ -1478,8 +1563,75 @@ index 000000000..2a24e955a
 +NautilusColumnsView *nautilus_columns_view_new (void);
 +
 +G_END_DECLS
+diff --git a/src/nautilus-file-chooser.c b/src/nautilus-file-chooser.c
+index 0adec31e1..a0c0a86bb 100644
+--- a/src/nautilus-file-chooser.c
++++ b/src/nautilus-file-chooser.c
+@@ -213,7 +213,7 @@ on_overwrite_confirm_response (AdwAlertDialog      *dialog,
+ 
+     if (g_strcmp0 (response, "replace") == 0)
+     {
+-        GFile *parent_location = nautilus_window_slot_get_location (self->slot);
++        GFile *parent_location = nautilus_window_slot_get_display_location (self->slot);
+         g_autofree char *new_filename = nautilus_filename_validator_get_new_name (self->validator);
+         g_autoptr (GFile) new_file_location = g_file_get_child (parent_location, new_filename);
+ 
+@@ -231,7 +231,7 @@ ask_confirm_overwrite (NautilusFileChooser *self)
+ {
+     AdwDialog *dialog = adw_alert_dialog_new (_("Replace When Saving?"), NULL);
+     g_autofree char *filename = nautilus_filename_validator_get_new_name (self->validator);
+-    g_autoptr (NautilusFile) directory_as_file = nautilus_file_get (nautilus_window_slot_get_location (self->slot));
++    g_autoptr (NautilusFile) directory_as_file = nautilus_file_get (nautilus_window_slot_get_display_location (self->slot));
+     const char *directory_name = nautilus_file_get_display_name (directory_as_file);
+ 
+     adw_alert_dialog_format_body (ADW_ALERT_DIALOG (dialog),
+@@ -283,7 +283,7 @@ action_accept (GSimpleAction *action,
+         }
+         else
+         {
+-            GFile *parent_location = nautilus_window_slot_get_location (self->slot);
++            GFile *parent_location = nautilus_window_slot_get_display_location (self->slot);
+             g_autofree char *name = nautilus_filename_validator_get_new_name (self->validator);
+             g_autoptr (GFile) file_location = g_file_get_child (parent_location, name);
+ 
+@@ -304,7 +304,7 @@ action_accept (GSimpleAction *action,
+         }
+         else
+         {
+-            GFile *location = nautilus_window_slot_get_location (self->slot);
++            GFile *location = nautilus_window_slot_get_display_location (self->slot);
+ 
+             emit_accepted (self, &(GList){ .data = location });
+         }
+@@ -498,7 +498,7 @@ on_location_changed (NautilusFileChooser *self)
+     }
+ 
+     g_autoptr (NautilusDirectory) directory = NULL;
+-    GFile *location = nautilus_window_slot_get_location (self->slot);
++    GFile *location = nautilus_window_slot_get_display_location (self->slot);
+     g_autofree char *scheme = g_file_get_uri_scheme (location);
+ 
+     if (nautilus_scheme_is_internal (scheme))
+@@ -743,7 +743,7 @@ nautilus_file_chooser_constructed (GObject *object)
+ 
+     /* Setup slot. */
+     self->slot = nautilus_window_slot_new (self->mode);
+-    g_signal_connect_swapped (self->slot, "notify::location", G_CALLBACK (on_location_changed), self);
++    g_signal_connect_swapped (self->slot, "notify::display-location", G_CALLBACK (on_location_changed), self);
+     adw_bin_set_child (self->slot_container, GTK_WIDGET (self->slot));
+     nautilus_window_slot_set_active (self->slot, TRUE);
+     g_signal_connect_swapped (self->slot, "notify::allow-stop",
+@@ -863,7 +863,7 @@ nautilus_file_chooser_init (NautilusFileChooser *self)
+         gtk_property_expression_new (NAUTILUS_TYPE_WINDOW_SLOT,
+                                      gtk_expression_ref (slot_expr),
+                                      "selection"),
+-        gtk_property_expression_new (NAUTILUS_TYPE_WINDOW_SLOT, slot_expr, "location"),
++        gtk_property_expression_new (NAUTILUS_TYPE_WINDOW_SLOT, slot_expr, "display-location"),
+         gtk_property_expression_new (NAUTILUS_TYPE_FILENAME_VALIDATOR, validator_expr, "passed"),
+     };
+ 
 diff --git a/src/nautilus-files-view.c b/src/nautilus-files-view.c
-index 49bf04a35..cae028e52 100644
+index 49bf04a35..18b37ff48 100644
 --- a/src/nautilus-files-view.c
 +++ b/src/nautilus-files-view.c
 @@ -41,6 +41,7 @@
@@ -1490,7 +1642,89 @@ index 49bf04a35..cae028e52 100644
  #include "nautilus-compress-dialog.h"
  #include "nautilus-dbus-launcher.h"
  #include "nautilus-directory.h"
-@@ -3224,7 +3225,8 @@ connect_inner_view (NautilusFilesView *self)
+@@ -1552,21 +1553,33 @@ action_open_with_other_application (GSimpleAction *action,
+     open_with_other_program (NAUTILUS_FILES_VIEW (user_data));
+ }
+ 
++/* The folder the user perceives as current: the deepest one open in the view. */
++static NautilusFile *
++get_current_folder (NautilusFilesView *self)
++{
++    GFile *location = nautilus_window_slot_get_display_location (self->slot);
++
++    if (location == NULL)
++    {
++        return (self->directory_as_file != NULL) ? nautilus_file_ref (self->directory_as_file) : NULL;
++    }
++
++    return nautilus_file_get (location);
++}
++
+ static void
+ action_open_current_directory_with_other_application (GSimpleAction *action,
+                                                       GVariant      *state,
+                                                       gpointer       user_data)
+ {
+-    GList *files;
+-
+     g_return_if_fail (NAUTILUS_IS_FILES_VIEW (user_data));
+ 
+     NautilusFilesView *self = user_data;
++    NautilusFile *folder = get_current_folder (self);
+ 
+-    if (self->directory_as_file != NULL)
++    if (folder != NULL)
+     {
+-        files = g_list_append (NULL, nautilus_file_ref (self->directory_as_file));
+-        choose_program (self, files);
++        choose_program (self, g_list_append (NULL, folder));
+     }
+ }
+ 
+@@ -1578,10 +1591,12 @@ action_open_current_directory_with_files (GSimpleAction *action,
+     g_return_if_fail (NAUTILUS_IS_FILES_VIEW (user_data));
+ 
+     NautilusFilesView *self = NAUTILUS_FILES_VIEW (user_data);
+-    if (self->directory_as_file != NULL)
++    g_autoptr (NautilusFile) folder = get_current_folder (self);
++
++    if (folder != NULL)
+     {
+         nautilus_files_view_activate_files (self,
+-                                            &(GList){ .data = self->directory_as_file, .next = NULL },
++                                            &(GList){ .data = folder, .next = NULL },
+                                             NAUTILUS_OPEN_FLAG_NEW_WINDOW,
+                                             FALSE);
+     }
+@@ -2466,7 +2481,9 @@ action_current_dir_open_console (GSimpleAction *action,
+     g_return_if_fail (NAUTILUS_IS_FILES_VIEW (user_data));
+ 
+     NautilusFilesView *self = user_data;
+-    real_open_console (self->directory_as_file, self);
++    g_autoptr (NautilusFile) folder = get_current_folder (self);
++
++    real_open_console (folder, self);
+ }
+ 
+ static void
+@@ -2513,12 +2530,13 @@ action_current_dir_properties (GSimpleAction *action,
+     g_return_if_fail (NAUTILUS_IS_FILES_VIEW (user_data));
+ 
+     NautilusFilesView *self = NAUTILUS_FILES_VIEW (user_data);
++    NautilusFile *folder = get_current_folder (self);
+ 
+-    if (self->directory_as_file != NULL)
++    if (folder != NULL)
+     {
+-        g_autoptr (GFile) location = nautilus_file_get_location (self->directory_as_file);
++        g_autoptr (GFile) location = nautilus_file_get_location (folder);
+ 
+-        files = g_list_append (NULL, nautilus_file_ref (self->directory_as_file));
++        files = g_list_append (NULL, folder);
+ 
+         nautilus_properties_present_dialog (files, GTK_WIDGET (self), location);
+ 
+@@ -3224,7 +3242,8 @@ connect_inner_view (NautilusFilesView *self)
                               G_CALLBACK (on_popup_selection_context_menu), self,
                               G_CONNECT_DEFAULT);
  
@@ -1500,7 +1734,7 @@ index 49bf04a35..cae028e52 100644
      {
          g_signal_connect_object (self->list_base, "load-subdirectory",
                                   G_CALLBACK (on_load_subdirectory), self,
-@@ -3234,6 +3236,13 @@ connect_inner_view (NautilusFilesView *self)
+@@ -3234,6 +3253,13 @@ connect_inner_view (NautilusFilesView *self)
                                   G_CONNECT_DEFAULT);
      }
  
@@ -1514,7 +1748,21 @@ index 49bf04a35..cae028e52 100644
      nautilus_list_base_add_overlay (self->list_base, self->empty_view_page);
  }
  
-@@ -9654,6 +9663,12 @@ create_inner_view (NautilusFilesView *self,
+@@ -5904,10 +5930,11 @@ action_copy_current_location (GSimpleAction *action,
+     NautilusFilesView *self = user_data;
+     GdkClipboard *clipboard;
+     GList *files;
++    NautilusFile *folder = get_current_folder (self);
+ 
+-    if (self->directory_as_file != NULL)
++    if (folder != NULL)
+     {
+-        files = g_list_append (NULL, nautilus_file_ref (self->directory_as_file));
++        files = g_list_append (NULL, folder);
+ 
+         clipboard = gtk_widget_get_clipboard (GTK_WIDGET (self));
+         nautilus_clipboard_prepare_for_files (clipboard, files, FALSE);
+@@ -9654,6 +9681,12 @@ create_inner_view (NautilusFilesView *self,
          }
          break;
  
@@ -1527,7 +1775,7 @@ index 49bf04a35..cae028e52 100644
          case NAUTILUS_VIEW_NETWORK_ID:
          {
              self->list_base = NAUTILUS_LIST_BASE (nautilus_network_view_new ());
-@@ -9694,8 +9709,15 @@ nautilus_files_view_get_toggle_icon_name (NautilusFilesView *self)
+@@ -9694,8 +9727,15 @@ nautilus_files_view_get_toggle_icon_name (NautilusFilesView *self)
          }
          break;
  
@@ -1544,7 +1792,7 @@ index 49bf04a35..cae028e52 100644
          {
              return "view-list-symbolic";
          }
-@@ -9735,8 +9757,18 @@ nautilus_files_view_get_toggle_tooltip (NautilusFilesView  *self,
+@@ -9735,8 +9775,18 @@ nautilus_files_view_get_toggle_tooltip (NautilusFilesView  *self,
          }
          break;
  
@@ -1564,7 +1812,7 @@ index 49bf04a35..cae028e52 100644
          {
              if (description != NULL)
              {
-@@ -9765,6 +9797,7 @@ nautilus_files_view_change (NautilusFilesView *self,
+@@ -9765,6 +9815,7 @@ nautilus_files_view_change (NautilusFilesView *self,
  
      /* Destroy existing inner view (which is owned by the overlay) */
      gtk_overlay_set_child (GTK_OVERLAY (self->overlay), NULL);
@@ -1572,6 +1820,430 @@ index 49bf04a35..cae028e52 100644
      g_clear_pointer (&self->subdirectories_loading, g_list_free);
      while (self->subdirectory_list != NULL)
      {
+diff --git a/src/nautilus-list-base-private.h b/src/nautilus-list-base-private.h
+index 6209de063..4e1d74377 100644
+--- a/src/nautilus-list-base-private.h
++++ b/src/nautilus-list-base-private.h
+@@ -23,6 +23,16 @@ NautilusFile      *nautilus_list_base_get_directory_as_file (NautilusListBase *s
+ NautilusViewModel *nautilus_list_base_get_model     (NautilusListBase *self);
+ GtkWidget         *nautilus_list_base_get_scrolled_window (NautilusListBase *self);
+ void               nautilus_list_base_setup_gestures (NautilusListBase *self);
++void               nautilus_list_base_set_single_click_selects_folders (NautilusListBase *self);
++void               nautilus_list_base_unload_subdirectory_delayed (NautilusListBase *self,
++                                                                   GtkTreeListRow   *row);
++
++/* Shared by the views using NautilusListZoomLevel. */
++guint              list_zoom_level_get_icon_size (int zoom_level);
++int                nautilus_list_base_get_default_list_zoom_level (NautilusListBase *self);
++void               nautilus_list_base_apply_list_zoom_level (NautilusListBase *self,
++                                                             int               zoom_level);
++gboolean           nautilus_list_base_get_sort_directories_first (NautilusListBase *self);
+ 
+ /* Shareable helpers */
+ void                          setup_cell_common                 (GObject          *listitem,
+diff --git a/src/nautilus-list-base.c b/src/nautilus-list-base.c
+index a4b4f0654..84af5ea03 100644
+--- a/src/nautilus-list-base.c
++++ b/src/nautilus-list-base.c
+@@ -27,6 +27,9 @@
+ /* 1 page worth of scroll in 100ms zooms in or out when the ctrl key is held */
+ #define SCROLL_TO_ZOOM_INTERVAL 100
+ 
++/* We wait two seconds after row is collapsed to unload the subdirectory */
++#define COLLAPSE_TO_UNLOAD_DELAY 2
++
+ /**
+  * NautilusListBase:
+  *
+@@ -51,6 +54,7 @@ struct _NautilusListBasePrivate
+ 
+     gboolean dnd_disabled;
+     gboolean single_click_mode;
++    gboolean single_click_selects_folders;
+ 
+     gboolean activate_on_release;
+     gboolean deny_background_click;
+@@ -315,13 +319,19 @@ on_item_click_released (GtkGestureClick *gesture,
+     {
+         NautilusViewModel *model;
+         guint i = nautilus_view_cell_get_position (cell);
++        g_autoptr (NautilusViewItem) item = nautilus_view_cell_get_item (cell);
+ 
+         model = nautilus_list_base_get_model (self);
+ 
+         /* Anticipate selection, enforcing single selection of target item. */
+         gtk_selection_model_select_item (GTK_SELECTION_MODEL (model), i, TRUE);
+ 
+-        nautilus_list_base_activate_selection (self, FALSE);
++        if (!priv->single_click_selects_folders ||
++            item == NULL ||
++            !nautilus_file_is_directory (nautilus_view_item_get_file (item)))
++        {
++            nautilus_list_base_activate_selection (self, FALSE);
++        }
+     }
+ 
+     rubberband_set_state (self, TRUE);
+@@ -1379,6 +1389,152 @@ nautilus_list_base_setup_gestures (NautilusListBase *self)
+     priv->view_drop_target = drop_target;
+ }
+ 
++/* In single-click mode, clicking a folder selects it instead of opening it. */
++void
++nautilus_list_base_set_single_click_selects_folders (NautilusListBase *self)
++{
++    NautilusListBasePrivate *priv = nautilus_list_base_get_instance_private (self);
++
++    priv->single_click_selects_folders = TRUE;
++}
++
++typedef struct
++{
++    NautilusListBase *self;
++    GtkTreeListRow *row;
++} UnloadDelayData;
++
++static void
++unload_delay_data_free (UnloadDelayData *unload_data)
++{
++    g_clear_weak_pointer (&unload_data->self);
++    g_clear_object (&unload_data->row);
++
++    g_free (unload_data);
++}
++
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (UnloadDelayData, unload_delay_data_free)
++
++static void
++unload_file_timeout (gpointer data)
++{
++    g_autoptr (UnloadDelayData) unload_data = data;
++
++    if (unload_data->self == NULL)
++    {
++        return;
++    }
++
++    if (gtk_tree_list_row_get_expanded (unload_data->row))
++    {
++        /* It has been expanded again before the timeout. Do nothing. */
++        return;
++    }
++
++    g_autoptr (NautilusViewItem) item = gtk_tree_list_row_get_item (unload_data->row);
++
++    if (item == NULL || nautilus_file_is_gone (nautilus_view_item_get_file (item)))
++    {
++        /* It's been removed in the meantime. */
++        return;
++    }
++
++    g_signal_emit_by_name (unload_data->self, "unload-subdirectory", item);
++}
++
++/* Emits ::unload-subdirectory for the collapsed @row after a delay, unless it
++ * has been expanded again by then. The subclass must define that signal. */
++void
++nautilus_list_base_unload_subdirectory_delayed (NautilusListBase *self,
++                                                GtkTreeListRow   *row)
++{
++    UnloadDelayData *unload_data = g_new0 (UnloadDelayData, 1);
++
++    g_set_weak_pointer (&unload_data->self, self);
++    g_set_object (&unload_data->row, row);
++
++    g_timeout_add_seconds_once (COLLAPSE_TO_UNLOAD_DELAY, unload_file_timeout, unload_data);
++}
++
++guint
++list_zoom_level_get_icon_size (int zoom_level)
++{
++    switch (zoom_level)
++    {
++        case NAUTILUS_LIST_ZOOM_LEVEL_SMALL:
++        {
++            return NAUTILUS_LIST_ICON_SIZE_SMALL;
++        }
++        break;
++
++        case NAUTILUS_LIST_ZOOM_LEVEL_MEDIUM:
++        {
++            return NAUTILUS_LIST_ICON_SIZE_MEDIUM;
++        }
++        break;
++
++        case NAUTILUS_LIST_ZOOM_LEVEL_LARGE:
++        {
++            return NAUTILUS_LIST_ICON_SIZE_LARGE;
++        }
++        break;
++    }
++    g_return_val_if_reached (NAUTILUS_LIST_ICON_SIZE_MEDIUM);
++}
++
++int
++nautilus_list_base_get_default_list_zoom_level (NautilusListBase *self)
++{
++    NautilusViewInfo info = nautilus_list_base_get_view_info (self);
++    int default_zoom_level = g_settings_get_enum (nautilus_list_view_preferences,
++                                                  NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL);
++
++    /* Sanitize preference value. */
++    return CLAMP (default_zoom_level, info.zoom_level_min, info.zoom_level_max);
++}
++
++/* Call after storing @zoom_level, so that ::get_icon_size returns the new size. */
++void
++nautilus_list_base_apply_list_zoom_level (NautilusListBase *self,
++                                          int               zoom_level)
++{
++    if (g_settings_get_enum (nautilus_list_view_preferences,
++                             NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL) != zoom_level)
++    {
++        g_settings_set_enum (nautilus_list_view_preferences,
++                             NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL,
++                             zoom_level);
++    }
++
++    g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_ICON_SIZE]);
++
++    if (zoom_level == NAUTILUS_LIST_ZOOM_LEVEL_SMALL)
++    {
++        gtk_widget_add_css_class (GTK_WIDGET (self), "compact");
++    }
++    else
++    {
++        gtk_widget_remove_css_class (GTK_WIDGET (self), "compact");
++    }
++}
++
++gboolean
++nautilus_list_base_get_sort_directories_first (NautilusListBase *self)
++{
++    NautilusListBasePrivate *priv = nautilus_list_base_get_instance_private (self);
++
++    /* Always treat directories as normal items in search and recent. Recent
++     * can accidentally contain directories when they were picked via file chooser. */
++    if (nautilus_file_is_in_search (priv->directory_as_file) ||
++        nautilus_file_is_in_recent (priv->directory_as_file))
++    {
++        return FALSE;
++    }
++
++    return g_settings_get_boolean (gtk_filechooser_preferences,
++                                   NAUTILUS_PREFERENCES_SORT_DIRECTORIES_FIRST);
++}
++
+ void
+ nautilus_list_base_disable_dnd (NautilusListBase *self)
+ {
+diff --git a/src/nautilus-list-view.c b/src/nautilus-list-view.c
+index dedf28d95..05c99d3fb 100644
+--- a/src/nautilus-list-view.c
++++ b/src/nautilus-list-view.c
+@@ -30,9 +30,6 @@
+ #include "nautilus-view-item.h"
+ #include "nautilus-view-model.h"
+ 
+-/* We wait two seconds after row is collapsed to unload the subdirectory */
+-#define COLLAPSE_TO_UNLOAD_DELAY 2
+-
+ struct _NautilusListView
+ {
+     NautilusListBase parent_instance;
+@@ -84,38 +81,12 @@ real_get_view_info (NautilusListBase *list_base)
+     return list_view_info;
+ }
+ 
+-static guint
+-get_icon_size_for_zoom_level (NautilusListZoomLevel zoom_level)
+-{
+-    switch (zoom_level)
+-    {
+-        case NAUTILUS_LIST_ZOOM_LEVEL_SMALL:
+-        {
+-            return NAUTILUS_LIST_ICON_SIZE_SMALL;
+-        }
+-        break;
+-
+-        case NAUTILUS_LIST_ZOOM_LEVEL_MEDIUM:
+-        {
+-            return NAUTILUS_LIST_ICON_SIZE_MEDIUM;
+-        }
+-        break;
+-
+-        case NAUTILUS_LIST_ZOOM_LEVEL_LARGE:
+-        {
+-            return NAUTILUS_LIST_ICON_SIZE_LARGE;
+-        }
+-        break;
+-    }
+-    g_return_val_if_reached (NAUTILUS_LIST_ICON_SIZE_MEDIUM);
+-}
+-
+ static guint
+ real_get_icon_size (NautilusListBase *list_base_view)
+ {
+     NautilusListView *self = NAUTILUS_LIST_VIEW (list_base_view);
+ 
+-    return get_icon_size_for_zoom_level (self->zoom_level);
++    return list_zoom_level_get_icon_size (self->zoom_level);
+ }
+ 
+ static int
+@@ -517,45 +488,15 @@ real_set_zoom_level (NautilusListBase *list_base,
+                       new_level <= list_view_info.zoom_level_max);
+ 
+     self->zoom_level = new_level;
+-
+-    if (g_settings_get_enum (nautilus_list_view_preferences,
+-                             NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL) != new_level)
+-    {
+-        g_settings_set_enum (nautilus_list_view_preferences,
+-                             NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL,
+-                             new_level);
+-    }
+-
+-    g_object_notify (G_OBJECT (self), "icon-size");
+-
+-    if (self->zoom_level == NAUTILUS_LIST_ZOOM_LEVEL_SMALL)
+-    {
+-        gtk_widget_add_css_class (GTK_WIDGET (self), "compact");
+-    }
+-    else
+-    {
+-        gtk_widget_remove_css_class (GTK_WIDGET (self), "compact");
+-    }
++    nautilus_list_base_apply_list_zoom_level (list_base, new_level);
+ }
+ 
+ static void
+ update_sort_directories_first (NautilusListView *self)
+ {
+-    NautilusFile *directory_as_file = nautilus_list_base_get_directory_as_file (NAUTILUS_LIST_BASE (self));
+     NautilusViewModel *model = nautilus_list_base_get_model (NAUTILUS_LIST_BASE (self));
+ 
+-    /* Always treat directories as normal items in search and recent. Recent
+-     * can accidentally contain directories when they were picked via file chooser. */
+-    if (nautilus_file_is_in_search (directory_as_file) ||
+-        nautilus_file_is_in_recent (directory_as_file))
+-    {
+-        self->directories_first = FALSE;
+-    }
+-    else
+-    {
+-        self->directories_first = g_settings_get_boolean (gtk_filechooser_preferences,
+-                                                          NAUTILUS_PREFERENCES_SORT_DIRECTORIES_FIRST);
+-    }
++    self->directories_first = nautilus_list_base_get_sort_directories_first (NAUTILUS_LIST_BASE (self));
+ 
+     if (model != NULL)
+     {
+@@ -620,18 +561,6 @@ nautilus_list_view_setup_directory (NautilusListBase  *list_base,
+     }
+ }
+ 
+-static gint
+-get_default_zoom_level (void)
+-{
+-    gint default_zoom_level = g_settings_get_enum (nautilus_list_view_preferences,
+-                                                   NAUTILUS_PREFERENCES_LIST_VIEW_DEFAULT_ZOOM_LEVEL);
+-
+-    /* Sanitize preference value. */
+-    return CLAMP (default_zoom_level,
+-                  list_view_info.zoom_level_min,
+-                  list_view_info.zoom_level_max);
+-}
+-
+ static NautilusViewItem *
+ real_get_backing_item (NautilusListBase *list_base)
+ {
+@@ -684,64 +613,6 @@ real_get_backing_item (NautilusListBase *list_base)
+     return NULL;
+ }
+ 
+-typedef struct
+-{
+-    NautilusListView *self;
+-    GtkTreeListRow *row;
+-} UnloadDelayData;
+-
+-static void
+-unload_delay_data_free (UnloadDelayData *unload_data)
+-{
+-    g_clear_weak_pointer (&unload_data->self);
+-    g_clear_object (&unload_data->row);
+-
+-    g_free (unload_data);
+-}
+-
+-G_DEFINE_AUTOPTR_CLEANUP_FUNC (UnloadDelayData, unload_delay_data_free)
+-
+-static UnloadDelayData *
+-unload_delay_data_new (NautilusListView *self,
+-                       GtkTreeListRow   *row)
+-{
+-    UnloadDelayData *unload_data;
+-
+-    unload_data = g_new0 (UnloadDelayData, 1);
+-    g_set_weak_pointer (&unload_data->self, self);
+-    g_set_object (&unload_data->row, row);
+-
+-    return unload_data;
+-}
+-
+-static void
+-unload_file_timeout (gpointer data)
+-{
+-    g_autoptr (UnloadDelayData) unload_data = data;
+-    NautilusListView *self = unload_data->self;
+-
+-    if (unload_data->self == NULL)
+-    {
+-        return;
+-    }
+-
+-    if (gtk_tree_list_row_get_expanded (unload_data->row))
+-    {
+-        /* It has been expanded again before the timeout. Do nothing. */
+-        return;
+-    }
+-
+-    g_autoptr (NautilusViewItem) item = gtk_tree_list_row_get_item (unload_data->row);
+-
+-    if (nautilus_file_is_gone (nautilus_view_item_get_file (item)))
+-    {
+-        /* It's been removed in the meantime. */
+-        return;
+-    }
+-
+-    g_signal_emit (self, signals[UNLOAD_SUBDIRECTORY], 0, item);
+-}
+-
+ static void
+ on_row_expanded_changed (GObject    *gobject,
+                          GParamSpec *pspec,
+@@ -758,9 +629,7 @@ on_row_expanded_changed (GObject    *gobject,
+     else
+     {
+         nautilus_view_item_set_loading (item, FALSE);
+-        g_timeout_add_seconds_once (COLLAPSE_TO_UNLOAD_DELAY,
+-                                    unload_file_timeout,
+-                                    unload_delay_data_new (self, row));
++        nautilus_list_base_unload_subdirectory_delayed (NAUTILUS_LIST_BASE (self), row);
+     }
+ }
+ 
+@@ -1128,7 +997,8 @@ nautilus_list_view_init (NautilusListView *self)
+                              self,
+                              G_CONNECT_SWAPPED);
+ 
+-    nautilus_list_base_set_zoom_level (NAUTILUS_LIST_BASE (self), get_default_zoom_level ());
++    nautilus_list_base_set_zoom_level (NAUTILUS_LIST_BASE (self),
++                                       nautilus_list_base_get_default_list_zoom_level (NAUTILUS_LIST_BASE (self)));
+ 
+     /* Set up tree expand/collapse shortcuts in capture phase otherwise they
+      * would be handled by GtkListBase's cursor movement shortcuts. */
 diff --git a/src/nautilus-toolbar.c b/src/nautilus-toolbar.c
 index 26edc8ccf..620f9c563 100644
 --- a/src/nautilus-toolbar.c
@@ -1685,7 +2357,7 @@ index 08dd77fb6..37bc62183 100644
  #define NAUTILUS_VIEW_NETWORK_ID         3
  #define NAUTILUS_VIEW_INVALID_ID         0
 diff --git a/src/nautilus-window-slot.c b/src/nautilus-window-slot.c
-index e22fb83da..b37345c4f 100644
+index e22fb83da..d975cd5c7 100644
 --- a/src/nautilus-window-slot.c
 +++ b/src/nautilus-window-slot.c
 @@ -64,6 +64,7 @@ enum
@@ -1718,6 +2390,15 @@ index e22fb83da..b37345c4f 100644
          case PROP_SEARCH_VISIBLE:
          {
              g_value_set_boolean (value, nautilus_window_slot_get_search_visible (self));
+@@ -893,7 +902,7 @@ nautilus_window_slot_constructed (GObject *object)
+     gtk_widget_add_css_class (button, "pill");
+     adw_status_page_set_child (self->global_search_page, button);
+ 
+-    g_object_bind_property (self, "location",
++    g_object_bind_property (self, "display-location",
+                             self->query_editor, "location",
+                             G_BINDING_DEFAULT);
+ 
 @@ -1091,7 +1100,8 @@ change_files_view_mode (NautilusWindowSlot *self,
                          guint               view_id)
  {
@@ -1745,7 +2426,91 @@ index e22fb83da..b37345c4f 100644
      else
      {
          change_files_view_mode (self, NAUTILUS_VIEW_LIST_ID);
-@@ -1341,6 +1356,9 @@ nautilus_window_slot_init (NautilusWindowSlot *self)
+@@ -1176,7 +1191,8 @@ action_unbookmark_current_directory (GSimpleAction *action,
+     NautilusWindowSlot *self = NAUTILUS_WINDOW_SLOT (user_data);
+     NautilusApplication *app = NAUTILUS_APPLICATION (g_application_get_default ());
+ 
+-    nautilus_bookmark_list_remove (nautilus_application_get_bookmarks (app), self->location);
++    nautilus_bookmark_list_remove (nautilus_application_get_bookmarks (app),
++                                   nautilus_window_slot_get_display_location (self));
+ }
+ 
+ static void
+@@ -1188,7 +1204,7 @@ action_bookmark_current_directory (GSimpleAction *action,
+     NautilusApplication *app = NAUTILUS_APPLICATION (g_application_get_default ());
+ 
+     nautilus_bookmark_list_add (nautilus_application_get_bookmarks (app),
+-                                self->location, -1);
++                                nautilus_window_slot_get_display_location (self), -1);
+ }
+ 
+ static void
+@@ -1197,9 +1213,10 @@ action_star_current_directory (GSimpleAction *action,
+                                gpointer       user_data)
+ {
+     NautilusWindowSlot *self = NAUTILUS_WINDOW_SLOT (user_data);
++    g_autoptr (NautilusFile) file = nautilus_file_get (nautilus_window_slot_get_display_location (self));
+ 
+     nautilus_tag_manager_star_files (nautilus_tag_manager_get (), G_OBJECT (self),
+-                                     &(GList){ .data = self->viewed_file }, NULL, NULL, NULL);
++                                     &(GList){ .data = file }, NULL, NULL, NULL);
+ }
+ 
+ static void
+@@ -1208,9 +1225,10 @@ action_unstar_current_directory (GSimpleAction *action,
+                                  gpointer       user_data)
+ {
+     NautilusWindowSlot *self = NAUTILUS_WINDOW_SLOT (user_data);
++    g_autoptr (NautilusFile) file = nautilus_file_get (nautilus_window_slot_get_display_location (self));
+ 
+     nautilus_tag_manager_unstar_files (nautilus_tag_manager_get (), G_OBJECT (self),
+-                                       &(GList){ .data = self->viewed_file }, NULL, NULL, NULL);
++                                       &(GList){ .data = file }, NULL, NULL, NULL);
+ }
+ 
+ const GActionEntry slot_entries[] =
+@@ -1258,16 +1276,17 @@ set_back_forward_accelerators (NautilusWindowSlot *self)
+ static void
+ update_bookmark_actions (NautilusWindowSlot *self)
+ {
++    GFile *location = nautilus_window_slot_get_display_location (self);
+     gboolean can_bookmark = FALSE;
+     gboolean can_unbookmark = FALSE;
+ 
+-    if (self->location != NULL)
++    if (location != NULL)
+     {
+         NautilusApplication *app = NAUTILUS_APPLICATION (g_application_get_default ());
+         NautilusBookmarkList *bookmarks = nautilus_application_get_bookmarks (app);
+ 
+-        can_bookmark = nautilus_bookmark_list_can_bookmark (bookmarks, self->location);
+-        can_unbookmark = nautilus_bookmark_list_contains (bookmarks, self->location);
++        can_bookmark = nautilus_bookmark_list_can_bookmark (bookmarks, location);
++        can_unbookmark = nautilus_bookmark_list_contains (bookmarks, location);
+     }
+ 
+     GAction *action_add = g_action_map_lookup_action (G_ACTION_MAP (self->slot_action_group),
+@@ -1281,15 +1300,16 @@ update_bookmark_actions (NautilusWindowSlot *self)
+ static void
+ update_star_unstar_actions (NautilusWindowSlot *self)
+ {
++    GFile *location = nautilus_window_slot_get_display_location (self);
+     gboolean can_star_location = FALSE;
+     gboolean is_starred = FALSE;
+ 
+-    if (self->location != NULL)
++    if (location != NULL)
+     {
+         NautilusTagManager *tag_manager = nautilus_tag_manager_get ();
+-        g_autofree gchar *uri = g_file_get_uri (self->location);
++        g_autofree gchar *uri = g_file_get_uri (location);
+ 
+-        can_star_location = nautilus_tag_manager_can_star_location (tag_manager, self->location);
++        can_star_location = nautilus_tag_manager_can_star_location (tag_manager, location);
+         if (uri != NULL)
+         {
+             is_starred = nautilus_tag_manager_file_is_starred (tag_manager, uri);
+@@ -1341,6 +1361,9 @@ nautilus_window_slot_init (NautilusWindowSlot *self)
      ADD_SHORTCUT_FOR_ACTION_WITH_ARGS (self->shortcuts,
                                         "slot.files-view-mode", "<control>2",
                                         "u", NAUTILUS_VIEW_GRID_ID);
@@ -1755,7 +2520,7 @@ index e22fb83da..b37345c4f 100644
      ADD_SHORTCUT_FOR_ACTION_WITH_ARGS (self->shortcuts,
                                         "slot.open-location", "<alt>Home|HomePage|Start",
                                         "s", home_uri);
-@@ -1381,7 +1399,8 @@ nautilus_window_slot_init (NautilusWindowSlot *self)
+@@ -1381,7 +1404,8 @@ nautilus_window_slot_init (NautilusWindowSlot *self)
  
      self->default_view_id = g_settings_get_enum (nautilus_preferences, NAUTILUS_PREFERENCES_DEFAULT_FOLDER_VIEWER);
      if (G_UNLIKELY (self->default_view_id != NAUTILUS_VIEW_LIST_ID &&
@@ -1765,7 +2530,7 @@ index e22fb83da..b37345c4f 100644
      {
          g_warning ("Invalid value stored for 'default-folder-viewer' key for "
                     "the 'org.gnome.nautilus.preferences' schemas. Installed "
-@@ -1558,6 +1577,7 @@ nautilus_window_slot_set_location (NautilusWindowSlot *self,
+@@ -1558,6 +1582,7 @@ nautilus_window_slot_set_location (NautilusWindowSlot *self,
      }
  
      g_set_object (&self->location, location);
@@ -1773,7 +2538,7 @@ index e22fb83da..b37345c4f 100644
  
      nautilus_window_slot_update_title (self);
  
-@@ -1567,6 +1587,7 @@ nautilus_window_slot_set_location (NautilusWindowSlot *self,
+@@ -1567,6 +1592,7 @@ nautilus_window_slot_set_location (NautilusWindowSlot *self,
      update_star_unstar_actions (self);
  
      g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_LOCATION]);
@@ -1781,7 +2546,7 @@ index e22fb83da..b37345c4f 100644
  }
  
  static void
-@@ -2575,6 +2596,7 @@ nautilus_window_slot_dispose (GObject *object)
+@@ -2575,6 +2601,7 @@ nautilus_window_slot_dispose (GObject *object)
      g_clear_object (&self->fd_holder);
  
      g_clear_object (&self->location);
@@ -1789,7 +2554,7 @@ index e22fb83da..b37345c4f 100644
      g_clear_object (&self->pending_file_to_activate);
      g_clear_pointer (&self->pending_selection, nautilus_file_list_free);
      g_clear_pointer (&self->selection, nautilus_file_list_free);
-@@ -2708,6 +2730,11 @@ nautilus_window_slot_class_init (NautilusWindowSlotClass *klass)
+@@ -2708,6 +2735,11 @@ nautilus_window_slot_class_init (NautilusWindowSlotClass *klass)
                               G_TYPE_FILE,
                               G_PARAM_READWRITE);
  
@@ -1801,7 +2566,7 @@ index e22fb83da..b37345c4f 100644
      properties[PROP_TOOLTIP] =
          g_param_spec_string ("tooltip",
                               "Tooltip that represents the slot",
-@@ -2742,6 +2769,28 @@ nautilus_window_slot_get_location (NautilusWindowSlot *self)
+@@ -2742,6 +2774,38 @@ nautilus_window_slot_get_location (NautilusWindowSlot *self)
      return self->location;
  }
  
@@ -1821,15 +2586,54 @@ index e22fb83da..b37345c4f 100644
 +{
 +    g_return_if_fail (NAUTILUS_IS_WINDOW_SLOT (self));
 +
-+    if (g_set_object (&self->display_location, location))
++    if (self->display_location == location ||
++        (self->display_location != NULL && location != NULL &&
++         g_file_equal (self->display_location, location)))
 +    {
-+        g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_DISPLAY_LOCATION]);
++        return;
 +    }
++
++    g_set_object (&self->display_location, location);
++
++    nautilus_window_slot_update_title (self);
++    update_bookmark_actions (self);
++    update_star_unstar_actions (self);
++
++    g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_DISPLAY_LOCATION]);
 +}
 +
  const gchar *
  nautilus_window_slot_get_title (NautilusWindowSlot *self)
  {
+@@ -2758,7 +2822,7 @@ nautilus_window_slot_get_title (NautilusWindowSlot *self)
+ static void
+ nautilus_window_slot_update_title (NautilusWindowSlot *self)
+ {
+-    g_autofree char *title = nautilus_compute_title_for_location (self->location);
++    g_autofree char *title = nautilus_compute_title_for_location (nautilus_window_slot_get_display_location (self));
+ 
+     if (g_strcmp0 (title, self->title) != 0)
+     {
+@@ -2987,6 +3051,19 @@ nautilus_window_slot_go_up (NautilusWindowSlot *self)
+         return;
+     }
+ 
++    g_autoptr (GFile) display_parent = g_file_get_parent (nautilus_window_slot_get_display_location (self));
++
++    if (display_parent != NULL &&
++        g_file_has_prefix (display_parent, self->location))
++    {
++        /* Up within the open subfolders: selecting the parent makes it the
++         * deepest open folder without changing the location. */
++        g_autolist (NautilusFile) selection = g_list_prepend (NULL, nautilus_file_get (display_parent));
++
++        nautilus_window_slot_open_location_full (self, self->location, selection);
++        return;
++    }
++
+     g_autoptr (GFile) parent = g_file_get_parent (self->location);
+ 
+     if (parent != NULL)
 diff --git a/src/nautilus-window-slot.h b/src/nautilus-window-slot.h
 index dab6e6988..e1eac7f8d 100644
 --- a/src/nautilus-window-slot.h
@@ -1844,6 +2648,37 @@ index dab6e6988..e1eac7f8d 100644
  
  GList * nautilus_window_slot_get_back_history              (NautilusWindowSlot *slot);
  GList * nautilus_window_slot_get_forward_history           (NautilusWindowSlot *slot);
+diff --git a/src/nautilus-window.c b/src/nautilus-window.c
+index 3c40bac3f..89e715ae0 100644
+--- a/src/nautilus-window.c
++++ b/src/nautilus-window.c
+@@ -400,7 +400,7 @@ on_update_page_tooltip (NautilusWindowSlot *slot,
+                         GParamSpec         *pspec,
+                         AdwTabPage         *page)
+ {
+-    GFile *location = nautilus_window_slot_get_location (slot);
++    GFile *location = nautilus_window_slot_get_display_location (slot);
+     g_autofree char *escaped_name = NULL;
+ 
+     if (location == NULL)
+@@ -1050,7 +1050,7 @@ extra_drag_value_cb (AdwTabBar    *self,
+                      gpointer      user_data)
+ {
+     NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
+-    g_autoptr (NautilusFile) file = nautilus_file_get (nautilus_window_slot_get_location (slot));
++    g_autoptr (NautilusFile) file = nautilus_file_get (nautilus_window_slot_get_display_location (slot));
+     GdkDragAction action = 0;
+ 
+     if (value != NULL)
+@@ -1080,7 +1080,7 @@ extra_drag_drop_cb (AdwTabBar    *self,
+ {
+     NautilusWindowSlot *slot = NAUTILUS_WINDOW_SLOT (adw_tab_page_get_child (page));
+     NautilusFilesView *view = nautilus_window_slot_get_current_view (slot);
+-    GFile *target_location = nautilus_window_slot_get_location (slot);
++    GFile *target_location = nautilus_window_slot_get_display_location (slot);
+     GdkDragAction action = adw_tab_bar_get_extra_drag_preferred_action (self);
+ 
+     return nautilus_dnd_perform_drop (view, value, action, target_location);
 diff --git a/src/resources/style.css b/src/resources/style.css
 index f3798c693..054f02cd1 100644
 --- a/src/resources/style.css
@@ -1869,6 +2704,22 @@ index f3798c693..054f02cd1 100644
  .nautilus-list-view.compact .nautilus-view-cell {
    padding-top: 3px;
    padding-bottom: 3px;
+diff --git a/src/resources/ui/shortcuts-dialog.blp b/src/resources/ui/shortcuts-dialog.blp
+index 5a93df6a9..549c7f44c 100644
+--- a/src/resources/ui/shortcuts-dialog.blp
++++ b/src/resources/ui/shortcuts-dialog.blp
+@@ -157,6 +157,11 @@ Adw.ShortcutsDialog shortcuts_dialog {
+       accelerator: "<Primary>2";
+     }
+ 
++    Adw.ShortcutsItem {
++      title: C_("shortcuts dialog", "Column View");
++      accelerator: "<Primary>3";
++    }
++
+     Adw.ShortcutsItem {
+       title: C_("shortcuts dialog", "Refresh View");
+       accelerator: "F5 <Primary>R";
 diff --git a/test/displayless/meson.build b/test/displayless/meson.build
 index 33adf349e..22da41420 100644
 --- a/test/displayless/meson.build
@@ -1883,10 +2734,10 @@ index 33adf349e..22da41420 100644
    'test-file-metadata': {},
 diff --git a/test/displayless/test-column-model.c b/test/displayless/test-column-model.c
 new file mode 100644
-index 000000000..05e5227b7
+index 000000000..6fb1caae4
 --- /dev/null
 +++ b/test/displayless/test-column-model.c
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,328 @@
 +/*
 + * Copyright (C) 2026 The GNOME project contributors
 + *
@@ -2072,10 +2923,52 @@ index 000000000..05e5227b7
 +    gtk_selection_model_select_item (GTK_SELECTION_MODEL (root), 0, TRUE);
 +    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 0));
 +
-+    /* Select every row of the child column, the way a rubberband drag does. */
 +    gtk_selection_model_select_all (GTK_SELECTION_MODEL (child));
 +
 +    g_assert_false (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 0));
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 1));
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 2));
++
++    /* A plain rubberband masks the whole column. */
++    g_autoptr (GtkBitset) first = gtk_bitset_new_range (0, 1);
++    g_autoptr (GtkBitset) all = gtk_bitset_new_range (0, 2);
++
++    gtk_selection_model_select_item (GTK_SELECTION_MODEL (root), 0, TRUE);
++    gtk_selection_model_set_selection (GTK_SELECTION_MODEL (child), first, all);
++
++    g_assert_false (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 0));
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 1));
++    g_assert_false (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 2));
++}
++
++/* Extending the selection over a whole column keeps the other columns'. */
++static void
++test_selection_extends_across_columns (Fixture       *fixture,
++                                       gconstpointer  data)
++{
++    g_autoptr (GtkTreeListRow) row_a = get_row (fixture->model, 0);
++    g_autoptr (NautilusColumnModel) root = nautilus_column_model_new (fixture->model, NULL);
++    g_autoptr (NautilusColumnModel) child = nautilus_column_model_new (fixture->model, row_a);
++    g_autoptr (GtkBitset) all = gtk_bitset_new_range (0, 2);
++
++    /* file_c, global 4, selected in the root column. */
++    gtk_selection_model_select_item (GTK_SELECTION_MODEL (root), 2, TRUE);
++
++    /* Ctrl+Shift click over the whole child column. */
++    gtk_selection_model_select_range (GTK_SELECTION_MODEL (child), 0, 2, FALSE);
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 4));
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 1));
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 2));
++
++    /* Ctrl rubberband over the whole child column. */
++    gtk_selection_model_unselect_item (GTK_SELECTION_MODEL (child), 0);
++    gtk_selection_model_set_selection (GTK_SELECTION_MODEL (child), all, all);
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 4));
++    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 1));
++
++    /* Shift click over the whole child column replaces. */
++    gtk_selection_model_select_range (GTK_SELECTION_MODEL (child), 0, 2, TRUE);
++    g_assert_false (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 4));
 +    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 1));
 +    g_assert_true (gtk_selection_model_is_selected (GTK_SELECTION_MODEL (fixture->model), 2));
 +}
@@ -2164,6 +3057,8 @@ index 000000000..05e5227b7
 +                fixture_set_up, test_path_row_is_not_selection, fixture_tear_down);
 +    g_test_add ("/column-model/selection-replaces-across-columns", Fixture, NULL,
 +                fixture_set_up, test_selection_replaces_across_columns, fixture_tear_down);
++    g_test_add ("/column-model/selection-extends-across-columns", Fixture, NULL,
++                fixture_set_up, test_selection_extends_across_columns, fixture_tear_down);
 +    g_test_add ("/column-model/child-slice-after-collapse", Fixture, NULL,
 +                fixture_set_up, test_child_slice_after_collapse, fixture_tear_down);
 +    g_test_add ("/column-model/positions-follow-sort-order", Fixture, NULL,
